@@ -126,7 +126,9 @@ automation:
 
 ### Connection drops frequently
 
-The integration automatically reconnects on connection loss. If issues persist:
+The integration automatically reconnects on connection loss. While a client is unreachable (asleep,
+stopped, or blocked), all of its entities are `unavailable`. They do not keep the last state. An
+automation that wakes a machine should treat `unavailable` like `off`. If issues persist:
 
 1. Check network stability between Home Assistant and FAH client
 2. Review Home Assistant logs for specific error messages
