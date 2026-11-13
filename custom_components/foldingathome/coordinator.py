@@ -32,6 +32,10 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._session: aiohttp.ClientSession | None = None
         self._listen_task: asyncio.Task | None = None
+        # At most one reconnect loop runs at a time. Parallel loops close each
+        # other's sockets and keep the connection in a disconnect/reconnect cycle.
+        self._reconnect_task: asyncio.Task | None = None
+        self._connect_lock = asyncio.Lock()
         self._shutdown: bool = False
         self._connected: bool = False
         self._reconnect_delay: int = 10  # Start with 10 seconds
@@ -120,24 +124,33 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self.data or {}
 
     async def _connect(self) -> None:
-        """Establish WebSocket connection."""
-        if self._shutdown:
-            return
+        """Establish WebSocket connection.
 
-        # Clean up any existing connection first
-        await self._cleanup()
+        The lock serializes callers (reconnect loop, user commands), so one
+        caller never tears down a socket that another caller just opened.
+        """
+        async with self._connect_lock:
+            if self._shutdown:
+                return
+            await self._connect_locked()
+
+    async def _connect_locked(self) -> None:
+        """Open a new connection. The caller holds _connect_lock."""
+        # Stop the old listener and close the old socket first
+        await self._stop_listener()
 
         _LOGGER.info("Connecting to FAH client at %s", self.ws_url)
 
         self._session = aiohttp.ClientSession()
         try:
-            self._ws = await self._session.ws_connect(
+            ws = await self._session.ws_connect(
                 self.ws_url,
                 timeout=aiohttp.ClientTimeout(total=WEBSOCKET_TIMEOUT),
             )
+            self._ws = ws
 
             # Wait for initial state
-            msg = await self._ws.receive(timeout=WEBSOCKET_TIMEOUT)
+            msg = await ws.receive(timeout=WEBSOCKET_TIMEOUT)
             if msg.type == aiohttp.WSMsgType.TEXT:
                 data = msg.data
                 if data != "ping":
@@ -152,22 +165,30 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._connected = True
             self._reconnect_delay = 10  # Reset backoff on success
 
-            # Start listener task
-            if self._listen_task is None or self._listen_task.done():
-                self._listen_task = self.hass.async_create_background_task(
-                    self._listen(), f"fah_listener_{self.host}"
-                )
+            # Start a listener bound to this socket
+            self._listen_task = self.hass.async_create_background_task(
+                self._listen(ws), f"fah_listener_{self.host}"
+            )
 
-        except Exception as err:
+        except BaseException:
+            # BaseException: a cancelled connect must also release the session
             self._connected = False
             await self._cleanup()
             raise
 
-    async def _listen(self) -> None:
-        """Listen for WebSocket messages."""
-        if self._ws is None:
-            return
+    async def _stop_listener(self) -> None:
+        """Close the current socket and wait for its listener to exit."""
+        task = self._listen_task
+        self._listen_task = None
+        # Cleanup first: self._ws no longer matches the listener's socket,
+        # so the listener exits without scheduling a reconnect.
+        await self._cleanup()
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.wait([task])
 
+    async def _listen(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Listen for WebSocket messages on one socket."""
         _LOGGER.debug("FAH WebSocket listener started for %s", self.host)
         # FAH sends updates every ~1 second when active, use 60s timeout to detect dead connections
         receive_timeout = 60
@@ -176,7 +197,7 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             while not self._shutdown:
                 try:
                     msg = await asyncio.wait_for(
-                        self._ws.receive(),
+                        ws.receive(),
                         timeout=receive_timeout
                     )
                 except asyncio.TimeoutError:
@@ -198,7 +219,7 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     except json.JSONDecodeError:
                         _LOGGER.warning("Invalid JSON from FAH %s", self.host)
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    _LOGGER.error("WebSocket error from %s: %s", self.host, self._ws.exception())
+                    _LOGGER.error("WebSocket error from %s: %s", self.host, ws.exception())
                     break
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
                     _LOGGER.info("WebSocket to %s closed", self.host)
@@ -210,38 +231,49 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             _LOGGER.error("WebSocket listener error for %s: %s", self.host, err)
         finally:
-            self._connected = False
-            await self._cleanup()
-            if not self._shutdown:
-                _LOGGER.info("FAH %s disconnected, will reconnect", self.host)
-                self._schedule_reconnect()
+            # A newer connection replaced this socket: leave its state alone
+            if self._ws is ws:
+                self._connected = False
+                await self._cleanup()
+                if not self._shutdown:
+                    _LOGGER.info("FAH %s disconnected, will reconnect", self.host)
+                    self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
-        """Schedule a reconnection attempt."""
+        """Start the reconnect loop if it is not already running."""
         if self._shutdown:
             return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
 
-        _LOGGER.info("FAH %s: reconnecting in %d seconds", self.host, self._reconnect_delay)
-        self.hass.async_create_background_task(
+        self._reconnect_task = self.hass.async_create_background_task(
             self._reconnect(), f"fah_reconnect_{self.host}"
         )
 
+    def _cancel_reconnect(self) -> None:
+        """Cancel a pending reconnect loop."""
+        task = self._reconnect_task
+        self._reconnect_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
     async def _reconnect(self) -> None:
-        """Attempt to reconnect after a delay."""
-        await asyncio.sleep(self._reconnect_delay)
+        """Retry the connection with backoff until it succeeds or shutdown."""
+        while not self._shutdown:
+            _LOGGER.info("FAH %s: reconnecting in %d seconds", self.host, self._reconnect_delay)
+            await asyncio.sleep(self._reconnect_delay)
 
-        if self._shutdown:
-            return
+            if self._shutdown:
+                return
 
-        # Increase delay for next time (exponential backoff, max 30 sec)
-        self._reconnect_delay = min(self._reconnect_delay * 2, 30)
+            # Increase delay for next time (exponential backoff, max 30 sec)
+            self._reconnect_delay = min(self._reconnect_delay * 2, 30)
 
-        try:
-            await self._connect()
-        except Exception as err:
-            _LOGGER.warning("FAH %s reconnection failed: %s", self.host, err)
-            if not self._shutdown:
-                self._schedule_reconnect()
+            try:
+                await self._connect()
+                return
+            except Exception as err:
+                _LOGGER.warning("FAH %s reconnection failed: %s", self.host, err)
 
     async def _cleanup(self) -> None:
         """Clean up WebSocket and session."""
@@ -265,15 +297,8 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Shutdown coordinator."""
         _LOGGER.info("Shutting down FAH coordinator for %s", self.host)
         self._shutdown = True
-
-        if self._listen_task is not None and not self._listen_task.done():
-            self._listen_task.cancel()
-            try:
-                await self._listen_task
-            except asyncio.CancelledError:
-                pass
-
-        await self._cleanup()
+        self._cancel_reconnect()
+        await self._stop_listener()
 
     async def async_send_command(self, command: dict[str, Any]) -> None:
         """Send command to FAH client."""
@@ -285,6 +310,8 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # If not connected, try to connect first
         if not self._connected or self._ws is None or self._ws.closed:
             _LOGGER.info("FAH %s: not connected, attempting connection for command", self.host)
+            # Connect now instead of waiting for the backoff delay
+            self._cancel_reconnect()
             try:
                 await self._connect()
             except Exception as err:
