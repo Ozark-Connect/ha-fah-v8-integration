@@ -9,7 +9,7 @@ from typing import Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, WEBSOCKET_PATH, UPDATE_INTERVAL, WEBSOCKET_TIMEOUT
 
@@ -71,8 +71,20 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "FAH client %s not available at startup: %s. Will keep trying.",
                 self.host, err
             )
+            self._mark_disconnected()
             # Start reconnection loop
             self._schedule_reconnect()
+
+    def _mark_disconnected(self) -> None:
+        """Mark the client unreachable so its entities become unavailable.
+
+        Without this the entities keep the last state they received. A rig
+        that went to sleep while folding then still reads as folding, and
+        automations that wake a rig only when its switch is off never wake it.
+        """
+        self._connected = False
+        if self.last_update_success:
+            self.async_set_update_error(UpdateFailed(f"FAH client {self.host} is not connected"))
 
     def _apply_incremental_update(self, update: list) -> None:
         """Apply an incremental update to the stored state."""
@@ -121,6 +133,8 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Called by HA coordinator on interval - just return current data."""
         # Don't try to connect here - let the listener/reconnect handle it
         # This prevents two things trying to connect at once
+        if not self._connected:
+            raise UpdateFailed(f"FAH client {self.host} is not connected")
         return self.data or {}
 
     async def _connect(self) -> None:
@@ -164,6 +178,10 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Connection successful
             self._connected = True
             self._reconnect_delay = 10  # Reset backoff on success
+            if not self.last_update_success:
+                # Entities become available again (the first message may not
+                # have been a full state dict)
+                self.async_set_updated_data(self.data or {})
 
             # Start a listener bound to this socket
             self._listen_task = self.hass.async_create_background_task(
@@ -172,7 +190,7 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         except BaseException:
             # BaseException: a cancelled connect must also release the session
-            self._connected = False
+            self._mark_disconnected()
             await self._cleanup()
             raise
 
@@ -233,7 +251,7 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         finally:
             # A newer connection replaced this socket: leave its state alone
             if self._ws is ws:
-                self._connected = False
+                self._mark_disconnected()
                 await self._cleanup()
                 if not self._shutdown:
                     _LOGGER.info("FAH %s disconnected, will reconnect", self.host)
@@ -326,5 +344,5 @@ class FAHDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.info("Sent command to FAH %s: %s", self.host, command)
             except Exception as err:
                 _LOGGER.error("FAH %s: failed to send command: %s", self.host, err)
-                self._connected = False
+                self._mark_disconnected()
                 self._schedule_reconnect()
